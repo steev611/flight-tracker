@@ -57,6 +57,7 @@ def empty_state() -> dict:
         "last_inflight_progress_ts": None,
         "takeoff_ts": None,
         "last_squawk": None,
+        "current_track": [],   # list of {lat, lon, alt, gs, ts} during current flight
     }
 
 
@@ -127,7 +128,14 @@ def step(prior: dict, obs: dict,
             new["current_flight_id"] = _new_flight_id(obs["ts"])
             new["takeoff_ts"] = obs["ts"]
             new["last_inflight_progress_ts"] = obs["ts"]  # reset clock so first progress is ~interval later
+            new["current_track"] = [_position_from_obs(obs)]
         else:
+            # Accumulate position trace during flight (deduped if same ts).
+            track = list(prior.get("current_track") or [])
+            point = _position_from_obs(obs)
+            if not track or track[-1].get("ts") != point.get("ts"):
+                track.append(point)
+            new["current_track"] = track
             # Airborne → airborne: maybe time for a progress update.
             last_progress = prior.get("last_inflight_progress_ts")
             if last_progress is None:
@@ -151,15 +159,20 @@ def step(prior: dict, obs: dict,
         new["absent_count"] = 0
         new["prior_status"] = None
         if was_airborne:
+            # Close out the flight: include the full track so the tracker can persist it.
+            final_track = list(prior.get("current_track") or [])
+            final_track.append(_position_from_obs(obs))
             events.append(Event("landing", {
                 "arrived_at": new["last_position"],
                 "flight_id": prior.get("current_flight_id"),
                 "takeoff_ts": prior.get("takeoff_ts"),
                 "elapsed_seconds": (obs["ts"] - prior["takeoff_ts"]) if prior.get("takeoff_ts") else None,
+                "track": final_track,
             }))
             new["current_flight_id"] = None
             new["takeoff_ts"] = None
             new["last_inflight_progress_ts"] = None
+            new["current_track"] = []
         new["status"] = "ground"
         new["signal_lost_emitted"] = False
 

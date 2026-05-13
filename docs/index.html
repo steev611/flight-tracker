@@ -42,7 +42,7 @@
 <body>
   <header>
     <h1>flight-tracker dashboard</h1>
-    <div class="sub">Generated 2026-05-13 22:54 BST (21:54 UTC)</div>
+    <div class="sub">Generated 2026-05-13 23:16 BST (22:16 UTC)</div>
   </header>
   <div class="container">
     <h2>Watched aircraft</h2>
@@ -77,7 +77,7 @@
           integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
           crossorigin=""></script>
   <script>
-    const flights = [{"d": [26.0726, -80.1527], "a": [44.80636, -68.82667], "label": "KFLL \u2192 KBGR"}, {"d": [44.80636, -68.82667], "a": [54.6181, -5.8725], "label": "KBGR \u2192 EGAC"}, {"d": [54.6181, -5.8725], "a": [49.17678, -0.45488], "label": "EGAC \u2192 LFRK"}, {"d": [49.17678, -0.45488], "a": [43.2525, 5.78519], "label": "LFRK \u2192 LFMQ"}, {"d": [43.2525, 5.78519], "a": [45.6306, 8.72811], "label": "LFMQ \u2192 LIMC"}];
+    const flights = [{"d": [26.0726, -80.1527], "a": [44.80636, -68.82667], "label": "KFLL \u2192 KBGR", "src": "backfill", "track": null}, {"d": [44.80636, -68.82667], "a": [54.6181, -5.8725], "label": "KBGR \u2192 EGAC", "src": "backfill", "track": null}, {"d": [54.6181, -5.8725], "a": [49.17678, -0.45488], "label": "EGAC \u2192 LFRK", "src": "backfill", "track": null}, {"d": [49.17678, -0.45488], "a": [43.2525, 5.78519], "label": "LFRK \u2192 LFMQ", "src": "backfill", "track": null}, {"d": [43.2525, 5.78519], "a": [45.6306, 8.72811], "label": "LFMQ \u2192 LIMC", "src": "backfill", "track": null}];
     const map = L.map('map');
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 18, attribution: '&copy; OpenStreetMap'
@@ -85,11 +85,19 @@
     if (flights.length) {
       const bounds = [];
       flights.forEach(f => {
-        L.polyline([f.d, f.a], {color:'#1d4ed8', weight:2, opacity:0.7})
-          .addTo(map).bindTooltip(f.label);
+        if (f.track && f.track.length > 1) {
+          // Tracker-captured real path
+          L.polyline(f.track, {color:'#1d4ed8', weight:3, opacity:0.85})
+            .addTo(map).bindTooltip(f.label + ' (real track)');
+          f.track.forEach(pt => bounds.push(pt));
+        } else {
+          // OpenSky backfill — only airport endpoints, render straight line dashed
+          L.polyline([f.d, f.a], {color:'#9ca3af', weight:1.5, opacity:0.6, dashArray:'4 6'})
+            .addTo(map).bindTooltip(f.label + ' (estimated)');
+          bounds.push(f.d, f.a);
+        }
         L.circleMarker(f.d, {radius:4, color:'#16a34a', fillOpacity:0.8}).addTo(map);
         L.circleMarker(f.a, {radius:4, color:'#dc2626', fillOpacity:0.8}).addTo(map);
-        bounds.push(f.d, f.a);
       });
       map.fitBounds(bounds, {padding:[20,20]});
     } else {

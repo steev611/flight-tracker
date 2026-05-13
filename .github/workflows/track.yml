@@ -36,6 +36,7 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           NOTIFY_TO: ${{ secrets.NOTIFY_TO }}
           NOTIFY_FROM: ${{ secrets.NOTIFY_FROM }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: python tracker.py
 
       - name: Rebuild dashboard

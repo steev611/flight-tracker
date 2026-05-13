@@ -12,7 +12,7 @@ from email.message import EmailMessage
 
 import requests
 
-from lib import airports, email_html
+from lib import airports, email_html, ntfy
 from lib.state_machine import classify_observation, empty_state, step
 from lib.timefmt import fmt_dual
 
@@ -84,6 +84,11 @@ def main(argv: list[str]) -> int:
             except Exception as e:
                 print(f"email send failed for {ac['registration']} {ev.type}: {e}",
                       file=sys.stderr)
+            try:
+                send_push(ac, ev, tz_name=tz_name)
+            except Exception as e:
+                print(f"ntfy push failed for {ac['registration']} {ev.type}: {e}",
+                      file=sys.stderr)
     elif args.dry_run and all_events:
         for ac, ev in all_events:
             subj, body, _html = render_email(ac, ev, tz_name=tz_name)
@@ -136,22 +141,30 @@ def record_event(ev, ac: dict, new_state: dict, prior: dict, dry_run: bool):
         f.write(json.dumps(record) + "\n")
 
     if ev.type == "landing":
-        # Close out the flight with a summary record.
+        # Close out the flight with a summary record + full position track.
         flights_path = FLIGHTS_DIR / f"flights_{month_key}.jsonl"
-        # Reconstruct takeoff from the landing event's flight_id + prior state's
-        # current_flight_id. We didn't persist the takeoff position separately;
-        # the takeoff event in events log has it. We just record what we know.
         arrived = ev.details.get("arrived_at") or {}
         dest = airports.describe_position(arrived.get("lat"), arrived.get("lon"))
+        track = ev.details.get("track") or []
+        origin = None
+        if track:
+            origin = airports.describe_position(track[0].get("lat"), track[0].get("lon"))
         summary = {
             "flight_id": ev.details.get("flight_id"),
             "registration": ac["registration"],
             "icao24": ac["icao24"],
+            "takeoff_ts": ev.details.get("takeoff_ts"),
             "landed_ts": int(now_dt.timestamp()),
             "landed_iso_utc": now_dt.isoformat(),
+            "elapsed_seconds": ev.details.get("elapsed_seconds"),
+            "origin": origin,
+            "origin_lat": track[0].get("lat") if track else None,
+            "origin_lon": track[0].get("lon") if track else None,
             "destination": dest,
             "destination_lat": arrived.get("lat"),
             "destination_lon": arrived.get("lon"),
+            # Compact track: just [lat, lon, alt, ts] per point to keep file small.
+            "track": [[p.get("lat"), p.get("lon"), p.get("alt"), p.get("ts")] for p in track],
         }
         with flights_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(summary) + "\n")
@@ -337,6 +350,18 @@ def send_email(ac: dict, ev, tz_name: str = "Europe/London"):
         s.login(user, password)
         s.send_message(msg, from_addr=from_addr, to_addrs=recipients)
     print(f"emailed {len(recipients)} recipient(s): {subj}")
+
+
+def send_push(ac: dict, ev, tz_name: str = "Europe/London"):
+    """Send a parallel ntfy.sh push notification. No-op if NTFY_TOPIC not set."""
+    subj, body, _ = render_email(ac, ev, tz_name=tz_name)
+    icao = ac["icao24"].lower()
+    ntfy.push_for_event(
+        event_type=ev.type,
+        title=subj,
+        body=body,
+        click_url=GLOBE_URL.format(icao=icao),
+    )
 
 
 if __name__ == "__main__":

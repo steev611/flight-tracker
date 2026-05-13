@@ -203,6 +203,41 @@ def test_normal_squawk_no_event():
     assert not any(e.type == "emergency_squawk" for e in events)
 
 
+# ---------- step: position track recording ----------
+
+def test_takeoff_starts_new_track():
+    s = empty_state()
+    s, _ = step(s, classify_observation(
+        {"alt_baro": 5000, "gs": 200, "lat": 40, "lon": -73}, ts=1000))
+    assert len(s["current_track"]) == 1
+    assert s["current_track"][0]["lat"] == 40
+
+def test_track_accumulates_over_polls():
+    s = empty_state()
+    s, _ = step(s, classify_observation(
+        {"alt_baro": 5000, "gs": 200, "lat": 40, "lon": -73}, ts=1000))
+    s, _ = step(s, classify_observation(
+        {"alt_baro": 20000, "gs": 350, "lat": 40.5, "lon": -73.5}, ts=2000))
+    s, _ = step(s, classify_observation(
+        {"alt_baro": 30000, "gs": 420, "lat": 41, "lon": -74}, ts=3000))
+    assert len(s["current_track"]) == 3
+    assert [p["lat"] for p in s["current_track"]] == [40, 40.5, 41]
+
+def test_landing_event_includes_full_track():
+    s = empty_state()
+    for i, lat in enumerate([40, 40.5, 41, 41.5], start=1):
+        s, _ = step(s, classify_observation(
+            {"alt_baro": 30000, "gs": 420, "lat": lat, "lon": -73}, ts=i*1000))
+    s, events = step(s, classify_observation(
+        {"alt_baro": "ground", "lat": 42, "lon": -74}, ts=5000))
+    landing = next(e for e in events if e.type == "landing")
+    track = landing.details["track"]
+    assert len(track) == 5  # 4 airborne + 1 final ground point
+    assert track[-1]["lat"] == 42
+    # State should be cleared
+    assert s["current_track"] == []
+
+
 def test_step_tolerates_old_state_missing_new_fields():
     """A state file written before in_flight fields existed should still work."""
     old_state = {

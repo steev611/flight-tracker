@@ -40,9 +40,7 @@ def load_all_flights() -> list[dict]:
     out = []
     if not FLIGHTS_DIR.exists():
         return out
-    # Both the OpenSky backfill format and the tracker-emitted flight summary
-    # use different keys; we normalize to: reg, departure_icao, arrival_icao,
-    # departure_lat/lon, arrival_lat/lon, firstSeen, lastSeen.
+    # OpenSky backfill: only airport endpoints, no trace
     for path in sorted(FLIGHTS_DIR.glob("backfill_*.jsonl")):
         with path.open("r", encoding="utf-8") as f:
             for line in f:
@@ -54,6 +52,20 @@ def load_all_flights() -> list[dict]:
                 except json.JSONDecodeError:
                     continue
                 norm = _normalize_backfill(rec)
+                if norm:
+                    out.append(norm)
+    # Tracker-emitted flights: full track of [lat, lon, alt, ts] points
+    for path in sorted(FLIGHTS_DIR.glob("flights_*.jsonl")):
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                norm = _normalize_tracker_flight(rec)
                 if norm:
                     out.append(norm)
     return out
@@ -80,6 +92,37 @@ def _normalize_backfill(rec: dict) -> Optional[dict]:
         "first_seen": rec["firstSeen"],
         "last_seen": rec["lastSeen"],
         "duration_minutes": rec.get("duration_minutes", (rec["lastSeen"] - rec["firstSeen"]) // 60),
+        "source": "backfill",
+        "track_pts": None,
+    }
+
+
+def _normalize_tracker_flight(rec: dict) -> Optional[dict]:
+    track = rec.get("track") or []
+    if not track or rec.get("destination_lat") is None:
+        return None
+    # Snap origin / destination to nearest airport for the table.
+    dep_a = airports.nearest(rec.get("origin_lat"), rec.get("origin_lon"), max_nm=10) \
+        if rec.get("origin_lat") is not None else None
+    arr_a = airports.nearest(rec["destination_lat"], rec["destination_lon"], max_nm=10)
+    first = track[0]
+    last = track[-1]
+    return {
+        "reg": rec.get("registration"),
+        "icao24": rec.get("icao24"),
+        "departure_icao": (dep_a or {}).get("icao") or "?",
+        "departure_name": (dep_a or {}).get("name") or rec.get("origin") or "—",
+        "departure_lat": first[0],
+        "departure_lon": first[1],
+        "arrival_icao": (arr_a or {}).get("icao") or "?",
+        "arrival_name": (arr_a or {}).get("name") or rec.get("destination") or "—",
+        "arrival_lat": last[0],
+        "arrival_lon": last[1],
+        "first_seen": rec.get("takeoff_ts") or first[3],
+        "last_seen": rec.get("landed_ts") or last[3],
+        "duration_minutes": (rec.get("elapsed_seconds") or 0) // 60,
+        "source": "tracker",
+        "track_pts": [[p[0], p[1]] for p in track if p[0] is not None and p[1] is not None],
     }
 
 
@@ -161,7 +204,9 @@ def render_page(config: dict, state: dict, flights: list[dict],
     flights_json = json.dumps([
         {"d": [f["departure_lat"], f["departure_lon"]],
          "a": [f["arrival_lat"],   f["arrival_lon"]],
-         "label": f"{f['departure_icao']} → {f['arrival_icao']}"}
+         "label": f"{f['departure_icao']} → {f['arrival_icao']}",
+         "src": f["source"],
+         "track": f.get("track_pts")}
         for f in flights
     ])
 
@@ -243,11 +288,19 @@ def render_page(config: dict, state: dict, flights: list[dict],
     if (flights.length) {{
       const bounds = [];
       flights.forEach(f => {{
-        L.polyline([f.d, f.a], {{color:'#1d4ed8', weight:2, opacity:0.7}})
-          .addTo(map).bindTooltip(f.label);
+        if (f.track && f.track.length > 1) {{
+          // Tracker-captured real path
+          L.polyline(f.track, {{color:'#1d4ed8', weight:3, opacity:0.85}})
+            .addTo(map).bindTooltip(f.label + ' (real track)');
+          f.track.forEach(pt => bounds.push(pt));
+        }} else {{
+          // OpenSky backfill — only airport endpoints, render straight line dashed
+          L.polyline([f.d, f.a], {{color:'#9ca3af', weight:1.5, opacity:0.6, dashArray:'4 6'}})
+            .addTo(map).bindTooltip(f.label + ' (estimated)');
+          bounds.push(f.d, f.a);
+        }}
         L.circleMarker(f.d, {{radius:4, color:'#16a34a', fillOpacity:0.8}}).addTo(map);
         L.circleMarker(f.a, {{radius:4, color:'#dc2626', fillOpacity:0.8}}).addTo(map);
-        bounds.push(f.d, f.a);
       }});
       map.fitBounds(bounds, {{padding:[20,20]}});
     }} else {{

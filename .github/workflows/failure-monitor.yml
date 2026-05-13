@@ -1,0 +1,52 @@
+name: failure-monitor
+
+# Fires when the tracker workflow finishes. If the latest run failed AND
+# the 3 most recent runs all failed, send an alert email so we know the
+# tracker is broken (without waiting for the weekly heartbeat).
+
+on:
+  workflow_run:
+    workflows: ["track"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  alert:
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Check consecutive failures
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          confs=$(gh run list --workflow=track.yml --limit 3 \
+            --json conclusion -q '.[].conclusion' \
+            --repo ${{ github.repository }})
+          echo "$confs"
+          fails=$(echo "$confs" | grep -c '^failure$' || true)
+          echo "consecutive_failures=$fails" >> $GITHUB_OUTPUT
+          echo "Consecutive failures: $fails / 3"
+
+      - name: Send alert email
+        if: ${{ steps.check.outputs.consecutive_failures == '3' }}
+        env:
+          CONSECUTIVE_FAILURES: ${{ steps.check.outputs.consecutive_failures }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          WORKFLOW: track
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          NOTIFY_TO: ${{ secrets.NOTIFY_TO }}
+          NOTIFY_FROM: ${{ secrets.NOTIFY_FROM }}
+        run: python notify_failure.py
