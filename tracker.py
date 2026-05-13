@@ -210,21 +210,22 @@ def send_email(ac: dict, ev):
     port = int(os.environ.get("SMTP_PORT", "587"))
     user = os.environ["SMTP_USER"]
     password = os.environ["SMTP_PASS"]
-    to_addr = os.environ["NOTIFY_TO"]
+    raw_to = os.environ["NOTIFY_TO"]
+    recipients = [a.strip() for a in raw_to.split(",") if a.strip()]
     from_addr = os.environ.get("NOTIFY_FROM", user)
 
     subj, body = render_email(ac, ev)
     msg = EmailMessage()
     msg["Subject"] = subj
     msg["From"] = from_addr
-    msg["To"] = to_addr
+    msg["To"] = ", ".join(recipients)
     msg.set_content(body)
 
     with smtplib.SMTP(host, port, timeout=HTTP_TIMEOUT) as s:
         s.starttls()
         s.login(user, password)
-        s.send_message(msg)
-    print(f"emailed {to_addr}: {subj}")
+        s.send_message(msg, from_addr=from_addr, to_addrs=recipients)
+    print(f"emailed {len(recipients)} recipient(s): {subj}")
 
 
 if __name__ == "__main__":
