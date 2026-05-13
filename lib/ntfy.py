@@ -7,7 +7,6 @@ Set the NTFY_TOPIC env var (or GHA secret) to the topic name.
 
 import os
 import requests
-from typing import Optional
 
 
 PRIORITY_BY_EVENT = {
@@ -27,9 +26,13 @@ TAGS_BY_EVENT = {
 }
 
 
-def push_for_event(event_type: str, title: str, body: str,
-                   click_url: Optional[str] = None) -> None:
-    """Send a push notification keyed by event_type. No-op if NTFY_TOPIC not set."""
+def push_for_event(event_type: str, title: str, body: str) -> None:
+    """Send a push notification keyed by event_type. No-op if NTFY_TOPIC not set.
+
+    Notification has no Click target — tapping it just opens the ntfy app and
+    shows the full body. The body itself contains a globe.adsb.lol link the
+    user can copy if they want live tracking.
+    """
     topic = os.environ.get("NTFY_TOPIC")
     if not topic:
         return
@@ -41,8 +44,6 @@ def push_for_event(event_type: str, title: str, body: str,
         "Priority": PRIORITY_BY_EVENT.get(event_type, "default"),
         "Tags": TAGS_BY_EVENT.get(event_type, "airplane"),
     }
-    if click_url:
-        headers["Click"] = click_url
     try:
         r = requests.post(url, data=body.encode("utf-8"), headers=headers, timeout=10)
         r.raise_for_status()

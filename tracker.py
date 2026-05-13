@@ -355,13 +355,7 @@ def send_email(ac: dict, ev, tz_name: str = "Europe/London"):
 def send_push(ac: dict, ev, tz_name: str = "Europe/London"):
     """Send a parallel ntfy.sh push notification. No-op if NTFY_TOPIC not set."""
     subj, body, _ = render_email(ac, ev, tz_name=tz_name)
-    icao = ac["icao24"].lower()
-    ntfy.push_for_event(
-        event_type=ev.type,
-        title=subj,
-        body=body,
-        click_url=GLOBE_URL.format(icao=icao),
-    )
+    ntfy.push_for_event(event_type=ev.type, title=subj, body=body)
 
 
 if __name__ == "__main__":
