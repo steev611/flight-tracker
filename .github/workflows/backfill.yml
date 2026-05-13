@@ -6,7 +6,7 @@ on:
       days:
         description: "Days of history to pull (max 30)"
         required: false
-        default: "30"
+        default: "7"
 
 permissions:
   contents: write

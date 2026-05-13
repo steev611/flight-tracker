@@ -26,7 +26,9 @@ FLIGHTS_DIR = ROOT / "flights"
 TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
 API_URL = "https://opensky-network.org/api/flights/aircraft"
 DAY = 24 * 3600
-DEFAULT_DAYS = 30
+DEFAULT_DAYS = 7
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 5
 
 
 def main():
@@ -64,17 +66,26 @@ def main():
 
 
 def get_token(client_id: str, client_secret: str) -> str:
-    r = requests.post(
-        TOKEN_URL,
-        data={
-            "grant_type": "client_credentials",
-            "client_id": client_id,
-            "client_secret": client_secret,
-        },
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()["access_token"]
+    last_exc = None
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            r = requests.post(
+                TOKEN_URL,
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                },
+                timeout=60,
+            )
+            r.raise_for_status()
+            return r.json()["access_token"]
+        except requests.RequestException as e:
+            last_exc = e
+            print(f"  token attempt {attempt}/{RETRY_ATTEMPTS} failed: {e}", file=sys.stderr)
+            if attempt < RETRY_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+    raise RuntimeError(f"OpenSky token fetch failed after {RETRY_ATTEMPTS} attempts: {last_exc}")
 
 
 def pull_flights(token: str, icao24: str, midnight_utc: int, days: int) -> list[dict]:
