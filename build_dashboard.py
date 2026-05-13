@@ -1,0 +1,262 @@
+"""Generate docs/index.html — a static dashboard from flights/* + state.json.
+
+Run after each tracker poll to keep the published GitHub Pages site up to date.
+Uses Leaflet via CDN for the map; everything else is plain HTML.
+"""
+
+import datetime
+import html
+import json
+import pathlib
+from typing import Optional
+
+from lib import airports
+from lib.timefmt import fmt_dual
+
+
+ROOT = pathlib.Path(__file__).resolve().parent
+CONFIG_PATH = ROOT / "config.json"
+STATE_PATH = ROOT / "state.json"
+FLIGHTS_DIR = ROOT / "flights"
+OUT_PATH = ROOT / "docs" / "index.html"
+REPO_URL = "https://github.com/steev611/flight-tracker"
+
+
+def main():
+    config = json.loads(CONFIG_PATH.read_text())
+    state = json.loads(STATE_PATH.read_text())
+    tz = config.get("display_timezone", "Europe/London")
+
+    flights = load_all_flights()
+    events = load_recent_events(days=30)
+
+    OUT_PATH.parent.mkdir(exist_ok=True)
+    html_out = render_page(config, state, flights, events, tz)
+    OUT_PATH.write_text(html_out, encoding="utf-8")
+    print(f"wrote {OUT_PATH.relative_to(ROOT)} ({len(flights)} flights, {len(events)} events)")
+
+
+def load_all_flights() -> list[dict]:
+    out = []
+    if not FLIGHTS_DIR.exists():
+        return out
+    # Both the OpenSky backfill format and the tracker-emitted flight summary
+    # use different keys; we normalize to: reg, departure_icao, arrival_icao,
+    # departure_lat/lon, arrival_lat/lon, firstSeen, lastSeen.
+    for path in sorted(FLIGHTS_DIR.glob("backfill_*.jsonl")):
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                norm = _normalize_backfill(rec)
+                if norm:
+                    out.append(norm)
+    return out
+
+
+def _normalize_backfill(rec: dict) -> Optional[dict]:
+    dep_icao = rec.get("estDepartureAirport")
+    arr_icao = rec.get("estArrivalAirport")
+    dep_a = airports.by_icao(dep_icao) if dep_icao else None
+    arr_a = airports.by_icao(arr_icao) if arr_icao else None
+    if not (dep_a and arr_a):
+        return None
+    return {
+        "reg": (rec.get("callsign") or "").strip() or None,
+        "icao24": rec.get("icao24"),
+        "departure_icao": dep_icao,
+        "departure_name": dep_a.get("name"),
+        "departure_lat": dep_a["lat"],
+        "departure_lon": dep_a["lon"],
+        "arrival_icao": arr_icao,
+        "arrival_name": arr_a.get("name"),
+        "arrival_lat": arr_a["lat"],
+        "arrival_lon": arr_a["lon"],
+        "first_seen": rec["firstSeen"],
+        "last_seen": rec["lastSeen"],
+        "duration_minutes": rec.get("duration_minutes", (rec["lastSeen"] - rec["firstSeen"]) // 60),
+    }
+
+
+def load_recent_events(days: int = 30) -> list[dict]:
+    if not FLIGHTS_DIR.exists():
+        return []
+    cutoff = int(datetime.datetime.now(datetime.timezone.utc).timestamp()) - days * 86400
+    out = []
+    for path in sorted(FLIGHTS_DIR.glob("events_*.jsonl")):
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("ts", 0) >= cutoff:
+                    out.append(rec)
+    out.sort(key=lambda r: r["ts"], reverse=True)
+    return out
+
+
+def render_page(config: dict, state: dict, flights: list[dict],
+                events: list[dict], tz: str) -> str:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    now_str = fmt_dual(now, tz)
+
+    cards = []
+    for ac in config["aircraft"]:
+        reg = ac["registration"]
+        s = state.get("aircraft", {}).get(reg) or {}
+        status = s.get("status", "unknown")
+        pos = s.get("last_position") or {}
+        place = airports.describe_position(pos.get("lat"), pos.get("lon"), max_nm=15) \
+            if pos.get("lat") is not None else "no position recorded"
+        status_color = {
+            "airborne": "#16a34a", "ground": "#1d4ed8",
+            "absent": "#6b7280", "unknown": "#9ca3af",
+        }.get(status, "#374151")
+        cards.append(f"""
+        <div class="card">
+          <div class="card-h">
+            <div class="reg">{html.escape(reg)}</div>
+            <div class="badge" style="background:{status_color}">{html.escape(status.upper())}</div>
+          </div>
+          <div class="meta">{html.escape(ac.get('type',''))} &middot; {html.escape(ac.get('owner',''))}</div>
+          <div class="loc">Last seen: {html.escape(place)}</div>
+          <a class="btn" href="https://globe.adsb.lol/?icao={html.escape(ac['icao24'].lower())}" target="_blank">Track live &rarr;</a>
+        </div>""")
+
+    events_rows = []
+    for ev in events[:50]:
+        t = fmt_dual(datetime.datetime.fromtimestamp(ev["ts"], datetime.timezone.utc), tz)
+        events_rows.append(
+            f"<tr><td>{html.escape(t)}</td>"
+            f"<td>{html.escape(ev.get('registration','?'))}</td>"
+            f"<td><span class='ev ev-{html.escape(ev.get('type','?'))}'>"
+            f"{html.escape(ev.get('type','?'))}</span></td></tr>"
+        )
+    if not events_rows:
+        events_rows = ["<tr><td colspan='3' class='empty'>No tracker events yet — first will appear after N83TY's next flight.</td></tr>"]
+
+    flights_rows = []
+    for f in sorted(flights, key=lambda x: x["first_seen"], reverse=True)[:30]:
+        t = datetime.datetime.fromtimestamp(f["first_seen"], datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
+        flights_rows.append(
+            f"<tr><td>{html.escape(t)}Z</td>"
+            f"<td><b>{html.escape(f['departure_icao'])}</b><br>"
+            f"<span class='dim'>{html.escape(f.get('departure_name') or '')}</span></td>"
+            f"<td><b>{html.escape(f['arrival_icao'])}</b><br>"
+            f"<span class='dim'>{html.escape(f.get('arrival_name') or '')}</span></td>"
+            f"<td>{f['duration_minutes']//60}h {f['duration_minutes']%60}m</td></tr>"
+        )
+    if not flights_rows:
+        flights_rows = ["<tr><td colspan='4' class='empty'>No flight history available.</td></tr>"]
+
+    flights_json = json.dumps([
+        {"d": [f["departure_lat"], f["departure_lon"]],
+         "a": [f["arrival_lat"],   f["arrival_lon"]],
+         "label": f"{f['departure_icao']} → {f['arrival_icao']}"}
+        for f in flights
+    ])
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>flight-tracker dashboard</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+        crossorigin="">
+  <style>
+    *{{box-sizing:border-box}}
+    body{{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f3f4f6;color:#111827}}
+    header{{background:#111827;color:#fff;padding:18px 24px}}
+    header h1{{margin:0;font-size:18px;font-weight:600}}
+    header .sub{{font-size:12px;opacity:0.7;margin-top:2px}}
+    .container{{max-width:1100px;margin:0 auto;padding:24px}}
+    h2{{font-size:14px;text-transform:uppercase;letter-spacing:0.8px;color:#6b7280;margin:24px 0 8px}}
+    .cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}}
+    .card{{background:#fff;border-radius:8px;padding:16px;box-shadow:0 1px 2px rgba(0,0,0,0.06)}}
+    .card-h{{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}}
+    .reg{{font-size:18px;font-weight:700}}
+    .badge{{color:#fff;font-size:11px;font-weight:700;letter-spacing:0.5px;padding:3px 8px;border-radius:4px}}
+    .meta{{font-size:12px;color:#6b7280;margin-bottom:8px}}
+    .loc{{font-size:13px;margin-bottom:12px}}
+    .btn{{display:inline-block;padding:6px 12px;background:#1d4ed8;color:#fff;border-radius:5px;text-decoration:none;font-size:13px;font-weight:500}}
+    #map{{height:420px;border-radius:8px;box-shadow:0 1px 2px rgba(0,0,0,0.06)}}
+    table{{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 2px rgba(0,0,0,0.06);font-size:13px}}
+    th{{text-align:left;padding:10px 12px;background:#f9fafb;color:#6b7280;font-size:11px;text-transform:uppercase;letter-spacing:0.5px}}
+    td{{padding:10px 12px;border-top:1px solid #f3f4f6;vertical-align:top}}
+    .dim{{color:#9ca3af;font-size:11px}}
+    .empty{{text-align:center;color:#9ca3af;padding:20px;font-style:italic}}
+    .ev{{padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px}}
+    .ev-takeoff{{background:#dcfce7;color:#166534}}
+    .ev-landing{{background:#dbeafe;color:#1e40af}}
+    .ev-in_flight_progress{{background:#fef3c7;color:#92400e}}
+    .ev-signal_lost{{background:#e5e7eb;color:#374151}}
+    .ev-emergency_squawk{{background:#fee2e2;color:#991b1b}}
+    footer{{padding:20px;text-align:center;color:#9ca3af;font-size:12px}}
+    footer a{{color:#6b7280}}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>flight-tracker dashboard</h1>
+    <div class="sub">Generated {html.escape(now_str)}</div>
+  </header>
+  <div class="container">
+    <h2>Watched aircraft</h2>
+    <div class="cards">{''.join(cards)}</div>
+
+    <h2>Recent flight routes</h2>
+    <div id="map"></div>
+
+    <h2>Recent events (tracker)</h2>
+    <table><thead><tr><th>When</th><th>Aircraft</th><th>Event</th></tr></thead>
+      <tbody>{''.join(events_rows)}</tbody></table>
+
+    <h2>Flight history (last 30 entries)</h2>
+    <table><thead><tr><th>Date (UTC)</th><th>From</th><th>To</th><th>Duration</th></tr></thead>
+      <tbody>{''.join(flights_rows)}</tbody></table>
+  </div>
+  <footer>
+    <a href="{REPO_URL}">View source on GitHub</a> &middot;
+    rebuilt automatically by the tracker workflow
+  </footer>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+          crossorigin=""></script>
+  <script>
+    const flights = {flights_json};
+    const map = L.map('map');
+    L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+      maxZoom: 18, attribution: '&copy; OpenStreetMap'
+    }}).addTo(map);
+    if (flights.length) {{
+      const bounds = [];
+      flights.forEach(f => {{
+        L.polyline([f.d, f.a], {{color:'#1d4ed8', weight:2, opacity:0.7}})
+          .addTo(map).bindTooltip(f.label);
+        L.circleMarker(f.d, {{radius:4, color:'#16a34a', fillOpacity:0.8}}).addTo(map);
+        L.circleMarker(f.a, {{radius:4, color:'#dc2626', fillOpacity:0.8}}).addTo(map);
+        bounds.push(f.d, f.a);
+      }});
+      map.fitBounds(bounds, {{padding:[20,20]}});
+    }} else {{
+      map.setView([54, 0], 4);
+    }}
+  </script>
+</body>
+</html>"""
+
+
+if __name__ == "__main__":
+    main()

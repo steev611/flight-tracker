@@ -32,6 +32,13 @@ GROUND_SPEED_AIRBORNE_KTS_DEFAULT = 50
 ABSENCE_THRESHOLD_POLLS_DEFAULT = 3
 INFLIGHT_PROGRESS_INTERVAL_SECONDS_DEFAULT = 1800  # 30 min
 
+# https://en.wikipedia.org/wiki/Transponder_codes#Emergency_codes
+EMERGENCY_SQUAWKS = {
+    "7500": "Hijacking / unlawful interference",
+    "7600": "Lost radio communications",
+    "7700": "General emergency",
+}
+
 
 @dataclass
 class Event:
@@ -49,6 +56,7 @@ def empty_state() -> dict:
         "signal_lost_emitted": False,
         "last_inflight_progress_ts": None,
         "takeoff_ts": None,
+        "last_squawk": None,
     }
 
 
@@ -61,12 +69,13 @@ def classify_observation(ac_entry: Optional[dict], ts: int,
     """
     if ac_entry is None:
         return {"kind": "absent", "lat": None, "lon": None, "alt": None,
-                "gs": None, "ts": ts}
+                "gs": None, "ts": ts, "squawk": None}
 
     alt = ac_entry.get("alt_baro")
     gs = ac_entry.get("gs")
     lat = ac_entry.get("lat")
     lon = ac_entry.get("lon")
+    squawk = ac_entry.get("squawk")
 
     if alt == "ground":
         kind = "ground"
@@ -78,7 +87,8 @@ def classify_observation(ac_entry: Optional[dict], ts: int,
         # No clear airborne signal; treat as ground.
         kind = "ground"
 
-    return {"kind": kind, "lat": lat, "lon": lon, "alt": alt, "gs": gs, "ts": ts}
+    return {"kind": kind, "lat": lat, "lon": lon, "alt": alt, "gs": gs,
+            "ts": ts, "squawk": squawk}
 
 
 def step(prior: dict, obs: dict,
@@ -168,6 +178,19 @@ def step(prior: dict, obs: dict,
                 "flight_id": prior.get("current_flight_id"),
             }))
             new["signal_lost_emitted"] = True
+
+    # Emergency squawk: fire when the squawk transitions INTO an emergency code.
+    # We watch for changes so we don't spam alerts on every poll during the event.
+    new_squawk = obs.get("squawk")
+    new["last_squawk"] = new_squawk
+    if (new_squawk in EMERGENCY_SQUAWKS
+            and new_squawk != prior.get("last_squawk")):
+        events.append(Event("emergency_squawk", {
+            "squawk": new_squawk,
+            "meaning": EMERGENCY_SQUAWKS[new_squawk],
+            "position": _position_from_obs(obs) if obs_kind != "absent" else None,
+            "flight_id": prior.get("current_flight_id"),
+        }))
 
     return new, events
 

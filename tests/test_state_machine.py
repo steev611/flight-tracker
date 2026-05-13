@@ -167,6 +167,42 @@ def test_landing_clears_takeoff_ts():
     assert events[0].details["elapsed_seconds"] == 4500
     assert s["takeoff_ts"] is None
 
+# ---------- step: emergency squawk ----------
+
+def test_emergency_squawk_7700_fires():
+    s = empty_state()
+    obs = classify_observation({"alt_baro": 30000, "gs": 400, "lat": 40, "lon": -73,
+                                 "squawk": "7700"}, ts=1000)
+    s, events = step(s, obs)
+    assert any(e.type == "emergency_squawk" for e in events)
+    em = next(e for e in events if e.type == "emergency_squawk")
+    assert em.details["squawk"] == "7700"
+    assert "emergency" in em.details["meaning"].lower()
+
+def test_emergency_squawk_not_refire_same_code():
+    s = empty_state()
+    s, _ = step(s, classify_observation({"alt_baro": 30000, "gs": 400, "lat": 40, "lon": -73,
+                                          "squawk": "7700"}, ts=1000))
+    s, events = step(s, classify_observation({"alt_baro": 30500, "gs": 405, "lat": 41, "lon": -74,
+                                                "squawk": "7700"}, ts=2000))
+    assert not any(e.type == "emergency_squawk" for e in events)
+
+def test_emergency_squawk_refires_on_new_code():
+    s = empty_state()
+    s, _ = step(s, classify_observation({"alt_baro": 30000, "gs": 400, "lat": 40, "lon": -73,
+                                          "squawk": "7600"}, ts=1000))
+    s, events = step(s, classify_observation({"alt_baro": 30500, "gs": 405, "lat": 41, "lon": -74,
+                                                "squawk": "7700"}, ts=2000))
+    assert any(e.type == "emergency_squawk" and e.details["squawk"] == "7700"
+               for e in events)
+
+def test_normal_squawk_no_event():
+    s = empty_state()
+    s, events = step(s, classify_observation({"alt_baro": 30000, "gs": 400, "lat": 40, "lon": -73,
+                                                "squawk": "2000"}, ts=1000))
+    assert not any(e.type == "emergency_squawk" for e in events)
+
+
 def test_step_tolerates_old_state_missing_new_fields():
     """A state file written before in_flight fields existed should still work."""
     old_state = {

@@ -38,11 +38,14 @@ jobs:
           NOTIFY_FROM: ${{ secrets.NOTIFY_FROM }}
         run: python tracker.py
 
-      - name: Commit state if changed
+      - name: Rebuild dashboard
+        run: python build_dashboard.py
+
+      - name: Commit state + dashboard if changed
         run: |
           git config user.name  "flight-tracker-bot"
           git config user.email "flight-tracker-bot@users.noreply.github.com"
-          git add state.json flights/ 2>/dev/null || true
+          git add state.json flights/ docs/ 2>/dev/null || true
           if git diff --staged --quiet; then
             echo "no changes"
           else

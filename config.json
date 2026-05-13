@@ -9,5 +9,6 @@
   ],
   "absence_threshold_polls": 3,
   "ground_speed_airborne_knots": 50,
-  "inflight_progress_interval_seconds": 1800
+  "inflight_progress_interval_seconds": 1800,
+  "display_timezone": "Europe/London"
 }
