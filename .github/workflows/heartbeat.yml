@@ -24,6 +24,7 @@ jobs:
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
-          NOTIFY_TO: ${{ secrets.NOTIFY_TO }}
+          # Ops email — Stuart doesn't need the weekly plumbing report
+          NOTIFY_TO: ${{ secrets.OPS_NOTIFY_TO }}
           NOTIFY_FROM: ${{ secrets.NOTIFY_FROM }}
         run: python heartbeat.py
