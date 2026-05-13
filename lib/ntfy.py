@@ -36,7 +36,8 @@ def push_for_event(event_type: str, title: str, body: str,
     server = os.environ.get("NTFY_SERVER", "https://ntfy.sh")
     url = f"{server.rstrip('/')}/{topic}"
     headers = {
-        "Title": title,
+        # HTTP headers are latin-1, so fold any wide unicode in the title to ASCII.
+        "Title": _ascii_safe(title),
         "Priority": PRIORITY_BY_EVENT.get(event_type, "default"),
         "Tags": TAGS_BY_EVENT.get(event_type, "airplane"),
     }
@@ -47,3 +48,23 @@ def push_for_event(event_type: str, title: str, body: str,
         r.raise_for_status()
     except Exception as e:
         print(f"ntfy push failed: {e}")
+
+
+# Common typographic characters that don't fit in latin-1 (so they'd
+# break HTTP header encoding). Folded to ASCII equivalents.
+_ASCII_FOLD = {
+    "—": "-",   # em-dash
+    "–": "-",   # en-dash
+    "‘": "'", "’": "'",   # smart single quotes
+    "“": '"', "”": '"',   # smart double quotes
+    "…": "...",                 # ellipsis
+    "→": "->",                  # right arrow
+    " ": " ",                   # non-breaking space
+}
+
+
+def _ascii_safe(s: str) -> str:
+    for k, v in _ASCII_FOLD.items():
+        s = s.replace(k, v)
+    # Anything remaining that latin-1 can't encode, drop entirely.
+    return s.encode("latin-1", "replace").decode("latin-1")
