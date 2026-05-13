@@ -1,0 +1,32 @@
+name: synthetic-check
+
+# Daily health check. Silent when everything is OK; emails the recipient
+# list only if SMTP auth or the ADS-B feeds are broken.
+
+on:
+  schedule:
+    - cron: "30 6 * * *"   # daily 06:30 UTC (07:30 BST / 06:30 GMT)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - run: pip install -r requirements.txt
+      - name: Run synthetic check
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          NOTIFY_TO: ${{ secrets.NOTIFY_TO }}
+          NOTIFY_FROM: ${{ secrets.NOTIFY_FROM }}
+        run: python synthetic_check.py
