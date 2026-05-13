@@ -29,6 +29,7 @@ def main():
 
     flights_raw = load_raw_flights()
     flights = [n for n in (_normalize(rec) for rec in flights_raw) if n]
+    flights = _dedupe_flights(flights)
     events = load_recent_events(days=30)
     stats = compute_stats(flights)
 
@@ -65,6 +66,28 @@ def compute_stats(flights: list[dict]) -> dict:
         "total_time":  _fmt_hm(total_minutes),
         "longest":     _fmt_hm(longest_minutes),
     }
+
+
+def _dedupe_flights(flights: list[dict], tolerance_seconds: int = 600) -> list[dict]:
+    """If a backfill and a tracker record represent the same flight (same icao24,
+    first_seen within tolerance), keep the tracker one (richer data)."""
+    by_key: dict[tuple, dict] = {}
+    for f in sorted(flights, key=lambda x: (x.get("icao24") or "", x.get("first_seen") or 0)):
+        # Find an existing bucket within tolerance for this aircraft.
+        match_key = None
+        for k in by_key:
+            icao, ts = k
+            if icao == (f.get("icao24") or "") and abs(ts - (f.get("first_seen") or 0)) <= tolerance_seconds:
+                match_key = k
+                break
+        if match_key is None:
+            by_key[(f.get("icao24") or "", f.get("first_seen") or 0)] = f
+        else:
+            current = by_key[match_key]
+            # Prefer the record that has a real track.
+            if (not current.get("track_full")) and f.get("track_full"):
+                by_key[match_key] = f
+    return list(by_key.values())
 
 
 def _fmt_hm(mins: int) -> str:
