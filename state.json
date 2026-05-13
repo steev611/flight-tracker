@@ -2,11 +2,14 @@
   "aircraft": {
     "N83TY": {
       "status": "absent",
-      "absent_count": 1,
+      "absent_count": 2,
       "prior_status": "unknown",
       "last_position": null,
       "current_flight_id": null,
-      "signal_lost_emitted": false
+      "signal_lost_emitted": false,
+      "last_inflight_progress_ts": null,
+      "takeoff_ts": null,
+      "last_squawk": null
     }
   }
 }
