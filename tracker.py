@@ -12,7 +12,7 @@ from email.message import EmailMessage
 
 import requests
 
-from lib import airports, email_html, ntfy
+from lib import airports, email_html, ntfy, geo
 from lib.state_machine import classify_observation, empty_state, step
 from lib.timefmt import fmt_dual
 
@@ -26,6 +26,7 @@ ADSB_SOURCES = [
     {"name": "airplanes.live", "url": "https://api.airplanes.live/v2/reg/{reg}"},
 ]
 GLOBE_URL = "https://globe.adsb.lol/?icao={icao}"
+DASHBOARD_URL = "https://steev611.github.io/flight-tracker/"
 HTTP_TIMEOUT = 20
 
 
@@ -163,8 +164,10 @@ def record_event(ev, ac: dict, new_state: dict, prior: dict, dry_run: bool):
             "destination": dest,
             "destination_lat": arrived.get("lat"),
             "destination_lon": arrived.get("lon"),
-            # Compact track: just [lat, lon, alt, ts] per point to keep file small.
-            "track": [[p.get("lat"), p.get("lon"), p.get("alt"), p.get("ts")] for p in track],
+            # Compact track: [lat, lon, alt, ts, gs] per point. gs added so the
+            # per-flight detail page can render a speed profile chart.
+            "track": [[p.get("lat"), p.get("lon"), p.get("alt"),
+                       p.get("ts"), p.get("gs")] for p in track],
         }
         with flights_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(summary) + "\n")
@@ -209,6 +212,7 @@ def render_email(ac: dict, ev, tz_name: str = "Europe/London") -> tuple[str, str
             f"Altitude: {pos.get('alt')} ft   Speed: {pos.get('gs')} kts\n"
             f"Detected at: {now}\n\n"
             f"Live view: {live}\n"
+            f"Dashboard: {DASHBOARD_URL}\n"
         )
         html_body = _html(f"Departed from {origin}", [
             ("Currently near", cur),
@@ -223,6 +227,11 @@ def render_email(ac: dict, ev, tz_name: str = "Europe/London") -> tuple[str, str
         dest = airports.describe_position(arr.get("lat"), arr.get("lon"))
         elapsed = ev.details.get("elapsed_seconds")
         duration_str = _fmt_duration(elapsed) if elapsed else "unknown"
+        track = ev.details.get("track") or []
+        distance_nm = round(geo.track_distance_nm(track)) if track else None
+        peak_alt = geo.peak_altitude_ft(track)
+        distance_str = f"{distance_nm:,} nm" if distance_nm else "—"
+        peak_str = geo.fmt_fl(peak_alt)
         subj = f"[{reg}] Landed at {dest}"
         body = (
             f"Aircraft: {reg} ({type_owner})\n"
@@ -230,12 +239,17 @@ def render_email(ac: dict, ev, tz_name: str = "Europe/London") -> tuple[str, str
             f"Arrived at: {dest}\n"
             f"Position: {arr.get('lat')}, {arr.get('lon')}\n"
             f"Flight duration: {duration_str}\n"
+            f"Distance flown: {distance_str}\n"
+            f"Peak altitude: {peak_str}\n"
             f"Detected at: {now}\n\n"
             f"Live view (last trace): {live}\n"
+            f"Dashboard: {DASHBOARD_URL}\n"
         )
         html_body = _html(f"Arrived at {dest}", [
             ("Position",         f"{arr.get('lat')}, {arr.get('lon')}"),
             ("Flight duration",  duration_str),
+            ("Distance flown",   distance_str),
+            ("Peak altitude",    peak_str),
         ])
         return subj, body, html_body
 
@@ -254,6 +268,7 @@ def render_email(ac: dict, ev, tz_name: str = "Europe/London") -> tuple[str, str
             f"Time since takeoff: {elapsed_str}\n"
             f"Detected at: {now}\n\n"
             f"Live view: {live}\n"
+            f"Dashboard: {DASHBOARD_URL}\n"
         )
         html_body = _html(f"In flight near {cur} — {elapsed_str} elapsed", [
             ("Position",         f"{pos.get('lat')}, {pos.get('lon')}"),
@@ -276,6 +291,7 @@ def render_email(ac: dict, ev, tz_name: str = "Europe/London") -> tuple[str, str
             f"Detected at: {now}\n\n"
             f"This usually means the plane landed outside ADS-B coverage.\n"
             f"Live view: {live}\n"
+            f"Dashboard: {DASHBOARD_URL}\n"
         )
         html_body = _html(f"Last seen near {where}", [
             ("Last position", f"{lk.get('lat')}, {lk.get('lon')}"),
@@ -305,6 +321,7 @@ def render_email(ac: dict, ev, tz_name: str = "Europe/London") -> tuple[str, str
             f"  7600 = Lost radio communications\n"
             f"  7700 = General emergency\n\n"
             f"This alert fires once per code change. Live: {live}\n"
+            f"Dashboard: {DASHBOARD_URL}\n"
         )
         html_body = _html(f"Squawk {squawk} — {meaning}", [
             ("Squawk",   f"{squawk} — {meaning}"),

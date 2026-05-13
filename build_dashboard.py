@@ -10,7 +10,7 @@ import json
 import pathlib
 from typing import Optional
 
-from lib import airports
+from lib import airports, geo
 from lib.timefmt import fmt_dual
 
 
@@ -27,48 +27,77 @@ def main():
     state = json.loads(STATE_PATH.read_text())
     tz = config.get("display_timezone", "Europe/London")
 
-    flights = load_all_flights()
+    flights_raw = load_raw_flights()
+    flights = [n for n in (_normalize(rec) for rec in flights_raw) if n]
     events = load_recent_events(days=30)
+    stats = compute_stats(flights)
 
     OUT_PATH.parent.mkdir(exist_ok=True)
-    html_out = render_page(config, state, flights, events, tz)
+    html_out = render_page(config, state, flights, events, stats, tz)
     OUT_PATH.write_text(html_out, encoding="utf-8")
     print(f"wrote {OUT_PATH.relative_to(ROOT)} ({len(flights)} flights, {len(events)} events)")
 
+    # Per-flight detail pages — only for flights with a real position track.
+    detail_dir = OUT_PATH.parent / "flights"
+    detail_dir.mkdir(exist_ok=True)
+    written = 0
+    for f in flights:
+        if f.get("track_full") and f.get("flight_id"):
+            page = build_flight_detail_page(f, tz)
+            (detail_dir / f"{f['flight_id']}.html").write_text(page, encoding="utf-8")
+            written += 1
+    print(f"wrote {written} per-flight detail page(s) in docs/flights/")
 
-def load_all_flights() -> list[dict]:
+
+def compute_stats(flights: list[dict]) -> dict:
+    now_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    week_cutoff = now_ts - 7 * 86400
+    month_cutoff = now_ts - 30 * 86400
+
+    durations = [f.get("duration_minutes") or 0 for f in flights]
+    total_minutes = sum(durations)
+    longest_minutes = max(durations) if durations else 0
+
+    return {
+        "total":       len(flights),
+        "this_week":   sum(1 for f in flights if (f.get("first_seen") or 0) >= week_cutoff),
+        "this_month":  sum(1 for f in flights if (f.get("first_seen") or 0) >= month_cutoff),
+        "total_time":  _fmt_hm(total_minutes),
+        "longest":     _fmt_hm(longest_minutes),
+    }
+
+
+def _fmt_hm(mins: int) -> str:
+    h, m = divmod(int(mins), 60)
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
+def load_raw_flights() -> list[dict]:
     out = []
     if not FLIGHTS_DIR.exists():
         return out
-    # OpenSky backfill: only airport endpoints, no trace
-    for path in sorted(FLIGHTS_DIR.glob("backfill_*.jsonl")):
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                norm = _normalize_backfill(rec)
-                if norm:
-                    out.append(norm)
-    # Tracker-emitted flights: full track of [lat, lon, alt, ts] points
-    for path in sorted(FLIGHTS_DIR.glob("flights_*.jsonl")):
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                norm = _normalize_tracker_flight(rec)
-                if norm:
-                    out.append(norm)
+    for pat in ("backfill_*.jsonl", "flights_*.jsonl"):
+        for path in sorted(FLIGHTS_DIR.glob(pat)):
+            with path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    rec["_source_file"] = path.name
+                    out.append(rec)
     return out
+
+
+def _normalize(rec: dict) -> Optional[dict]:
+    if rec.get("_source_file", "").startswith("backfill_"):
+        return _normalize_backfill(rec)
+    return _normalize_tracker_flight(rec)
 
 
 def _normalize_backfill(rec: dict) -> Optional[dict]:
@@ -110,6 +139,7 @@ def _normalize_tracker_flight(rec: dict) -> Optional[dict]:
     return {
         "reg": rec.get("registration"),
         "icao24": rec.get("icao24"),
+        "flight_id": rec.get("flight_id"),
         "departure_icao": (dep_a or {}).get("icao") or "?",
         "departure_name": (dep_a or {}).get("name") or rec.get("origin") or "—",
         "departure_lat": first[0],
@@ -123,6 +153,7 @@ def _normalize_tracker_flight(rec: dict) -> Optional[dict]:
         "duration_minutes": (rec.get("elapsed_seconds") or 0) // 60,
         "source": "tracker",
         "track_pts": [[p[0], p[1]] for p in track if p[0] is not None and p[1] is not None],
+        "track_full": track,  # full [lat, lon, alt, ts, gs] for per-flight detail page
     }
 
 
@@ -148,7 +179,7 @@ def load_recent_events(days: int = 30) -> list[dict]:
 
 
 def render_page(config: dict, state: dict, flights: list[dict],
-                events: list[dict], tz: str) -> str:
+                events: list[dict], stats: dict, tz: str) -> str:
     now = datetime.datetime.now(datetime.timezone.utc)
     now_str = fmt_dual(now, tz)
 
@@ -190,8 +221,12 @@ def render_page(config: dict, state: dict, flights: list[dict],
     flights_rows = []
     for f in sorted(flights, key=lambda x: x["first_seen"], reverse=True)[:30]:
         t = datetime.datetime.fromtimestamp(f["first_seen"], datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")
+        date_cell = f"{html.escape(t)}Z"
+        if f.get("flight_id") and f.get("track_full"):
+            date_cell = (f"<a href='flights/{html.escape(f['flight_id'])}.html'>"
+                         f"{html.escape(t)}Z &rarr;</a>")
         flights_rows.append(
-            f"<tr><td>{html.escape(t)}Z</td>"
+            f"<tr><td>{date_cell}</td>"
             f"<td><b>{html.escape(f['departure_icao'])}</b><br>"
             f"<span class='dim'>{html.escape(f.get('departure_name') or '')}</span></td>"
             f"<td><b>{html.escape(f['arrival_icao'])}</b><br>"
@@ -228,6 +263,10 @@ def render_page(config: dict, state: dict, flights: list[dict],
     .container{{max-width:1100px;margin:0 auto;padding:24px}}
     h2{{font-size:14px;text-transform:uppercase;letter-spacing:0.8px;color:#6b7280;margin:24px 0 8px}}
     .cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}}
+    .stat-cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}}
+    .stat{{background:#fff;border-radius:8px;padding:14px 16px;box-shadow:0 1px 2px rgba(0,0,0,0.06)}}
+    .stat-num{{font-size:22px;font-weight:700;color:#111827}}
+    .stat-label{{font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px;margin-top:2px}}
     .card{{background:#fff;border-radius:8px;padding:16px;box-shadow:0 1px 2px rgba(0,0,0,0.06)}}
     .card-h{{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}}
     .reg{{font-size:18px;font-weight:700}}
@@ -259,6 +298,15 @@ def render_page(config: dict, state: dict, flights: list[dict],
   <div class="container">
     <h2>Watched aircraft</h2>
     <div class="cards">{''.join(cards)}</div>
+
+    <h2>Stats</h2>
+    <div class="stat-cards">
+      <div class="stat"><div class="stat-num">{stats['total']}</div><div class="stat-label">Total flights tracked</div></div>
+      <div class="stat"><div class="stat-num">{stats['this_week']}</div><div class="stat-label">This week</div></div>
+      <div class="stat"><div class="stat-num">{stats['this_month']}</div><div class="stat-label">Last 30 days</div></div>
+      <div class="stat"><div class="stat-num">{html.escape(stats['total_time'])}</div><div class="stat-label">Total time aloft</div></div>
+      <div class="stat"><div class="stat-num">{html.escape(stats['longest'])}</div><div class="stat-label">Longest flight</div></div>
+    </div>
 
     <h2>Recent flight routes</h2>
     <div id="map"></div>
@@ -306,6 +354,126 @@ def render_page(config: dict, state: dict, flights: list[dict],
     }} else {{
       map.setView([54, 0], 4);
     }}
+  </script>
+</body>
+</html>"""
+
+
+def build_flight_detail_page(f: dict, tz: str) -> str:
+    """Render a standalone HTML page for one flight: map + altitude + speed charts."""
+    track = f["track_full"]  # [[lat, lon, alt, ts, gs], ...]
+    distance_nm = round(geo.track_distance_nm(track))
+    peak_alt = geo.peak_altitude_ft(track)
+    dur = f["duration_minutes"]
+    dur_str = f"{dur // 60}h {dur % 60}m"
+
+    takeoff_str = fmt_dual(datetime.datetime.fromtimestamp(f["first_seen"], datetime.timezone.utc), tz)
+    landed_str = fmt_dual(datetime.datetime.fromtimestamp(f["last_seen"], datetime.timezone.utc), tz)
+
+    # Time-series for charts: convert ts deltas (seconds since takeoff) → minutes
+    t0 = f["first_seen"]
+    chart_data = [
+        {
+            "t": round((p[3] - t0) / 60, 1),
+            "alt": p[2] if isinstance(p[2], (int, float)) else 0,
+            "gs": p[4] if len(p) > 4 and isinstance(p[4], (int, float)) else None,
+        }
+        for p in track if p[3] is not None
+    ]
+    track_latlon = [[p[0], p[1]] for p in track if p[0] is not None and p[1] is not None]
+
+    title = f"{f['reg']} · {f['departure_icao']} → {f['arrival_icao']}"
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{html.escape(title)} · flight-tracker</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+        crossorigin="">
+  <style>
+    *{{box-sizing:border-box}}
+    body{{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f3f4f6;color:#111827}}
+    header{{background:#111827;color:#fff;padding:18px 24px}}
+    header a{{color:#9ca3af;text-decoration:none;font-size:12px}}
+    header h1{{margin:6px 0 0;font-size:20px;font-weight:600}}
+    header .route{{font-size:13px;opacity:0.8;margin-top:4px}}
+    .container{{max-width:1100px;margin:0 auto;padding:24px}}
+    .stat-cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:20px}}
+    .stat{{background:#fff;border-radius:8px;padding:12px;box-shadow:0 1px 2px rgba(0,0,0,0.06)}}
+    .stat-num{{font-size:18px;font-weight:700}}
+    .stat-label{{font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px;margin-top:2px}}
+    #map{{height:380px;border-radius:8px;margin-bottom:20px;box-shadow:0 1px 2px rgba(0,0,0,0.06)}}
+    .chart-card{{background:#fff;border-radius:8px;padding:16px;margin-bottom:14px;box-shadow:0 1px 2px rgba(0,0,0,0.06)}}
+    .chart-card h3{{margin:0 0 12px;font-size:13px;color:#6b7280;text-transform:uppercase;letter-spacing:0.5px}}
+    canvas{{width:100%!important;height:200px!important}}
+  </style>
+</head>
+<body>
+  <header>
+    <a href="../index.html">&larr; back to dashboard</a>
+    <h1>{html.escape(title)}</h1>
+    <div class="route">{html.escape(f.get('departure_name') or '')} &rarr; {html.escape(f.get('arrival_name') or '')}</div>
+  </header>
+  <div class="container">
+    <div class="stat-cards">
+      <div class="stat"><div class="stat-num">{dur_str}</div><div class="stat-label">Duration</div></div>
+      <div class="stat"><div class="stat-num">{distance_nm:,} nm</div><div class="stat-label">Distance flown</div></div>
+      <div class="stat"><div class="stat-num">{html.escape(geo.fmt_fl(peak_alt))}</div><div class="stat-label">Peak altitude</div></div>
+      <div class="stat"><div class="stat-num" style="font-size:14px;font-weight:500">{html.escape(takeoff_str)}</div><div class="stat-label">Takeoff</div></div>
+      <div class="stat"><div class="stat-num" style="font-size:14px;font-weight:500">{html.escape(landed_str)}</div><div class="stat-label">Landing</div></div>
+    </div>
+
+    <div id="map"></div>
+
+    <div class="chart-card">
+      <h3>Altitude profile</h3>
+      <canvas id="alt-chart"></canvas>
+    </div>
+    <div class="chart-card">
+      <h3>Ground speed profile</h3>
+      <canvas id="speed-chart"></canvas>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+          crossorigin=""></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script>
+    const track = {json.dumps(track_latlon)};
+    const series = {json.dumps(chart_data)};
+
+    const map = L.map('map');
+    L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+      maxZoom: 18, attribution: '&copy; OpenStreetMap'
+    }}).addTo(map);
+    L.polyline(track, {{color:'#1d4ed8', weight:3, opacity:0.9}}).addTo(map);
+    L.circleMarker(track[0], {{radius:5, color:'#16a34a', fillOpacity:0.9}}).addTo(map);
+    L.circleMarker(track[track.length-1], {{radius:5, color:'#dc2626', fillOpacity:0.9}}).addTo(map);
+    map.fitBounds(track, {{padding:[20,20]}});
+
+    const t = series.map(p => p.t.toFixed(0) + 'm');
+    new Chart(document.getElementById('alt-chart'), {{
+      type: 'line',
+      data: {{ labels: t,
+        datasets: [{{ data: series.map(p => p.alt), borderColor:'#1d4ed8',
+                     backgroundColor:'rgba(29,78,216,0.1)', fill:true, tension:0.3,
+                     pointRadius:1.5 }}] }},
+      options: {{ plugins:{{legend:{{display:false}}}},
+        scales:{{ y:{{ ticks:{{ callback:v=>v.toLocaleString()+' ft' }} }} }} }}
+    }});
+    new Chart(document.getElementById('speed-chart'), {{
+      type: 'line',
+      data: {{ labels: t,
+        datasets: [{{ data: series.map(p => p.gs), borderColor:'#ca8a04',
+                     backgroundColor:'rgba(202,138,4,0.1)', fill:true, tension:0.3,
+                     spanGaps:true, pointRadius:1.5 }}] }},
+      options: {{ plugins:{{legend:{{display:false}}}},
+        scales:{{ y:{{ ticks:{{ callback:v=>v+' kts' }} }} }} }}
+    }});
   </script>
 </body>
 </html>"""
