@@ -1,0 +1,12 @@
+{
+  "aircraft": [
+    {
+      "registration": "N83TY",
+      "icao24": "ab57c1",
+      "type": "Falcon 50EX",
+      "owner": "Zoe Air Delaware Inc"
+    }
+  ],
+  "absence_threshold_polls": 3,
+  "ground_speed_airborne_knots": 50
+}

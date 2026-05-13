@@ -1,0 +1,11 @@
+.claude/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.venv/
+venv/
+.DS_Store
+*.swp
+.idea/
+.vscode/

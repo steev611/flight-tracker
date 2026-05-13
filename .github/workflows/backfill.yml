@@ -1,0 +1,44 @@
+name: backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Days of history to pull (max 30)"
+        required: false
+        default: "30"
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - run: pip install -r requirements.txt
+
+      - name: Pull OpenSky history
+        env:
+          OPENSKY_CLIENT_ID: ${{ secrets.OPENSKY_CLIENT_ID }}
+          OPENSKY_CLIENT_SECRET: ${{ secrets.OPENSKY_CLIENT_SECRET }}
+          BACKFILL_DAYS: ${{ inputs.days }}
+        run: python backfill.py
+
+      - name: Commit backfill data
+        run: |
+          git config user.name  "flight-tracker-bot"
+          git config user.email "flight-tracker-bot@users.noreply.github.com"
+          git add flights/
+          if git diff --staged --quiet; then
+            echo "no changes"
+          else
+            git commit -m "backfill: OpenSky history pull"
+            git push
+          fi
