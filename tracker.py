@@ -20,7 +20,10 @@ ROOT = pathlib.Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
 STATE_PATH = ROOT / "state.json"
 FLIGHTS_DIR = ROOT / "flights"
-ADSB_URL = "https://api.adsb.lol/v2/reg/{reg}"
+ADSB_SOURCES = [
+    {"name": "adsb.lol",       "url": "https://api.adsb.lol/v2/reg/{reg}"},
+    {"name": "airplanes.live", "url": "https://api.airplanes.live/v2/reg/{reg}"},
+]
 GLOBE_URL = "https://globe.adsb.lol/?icao={icao}"
 HTTP_TIMEOUT = 20
 
@@ -45,11 +48,7 @@ def main(argv: list[str]) -> int:
         icao = ac["icao24"].lower()
         prior = state["aircraft"].get(reg) or empty_state()
 
-        try:
-            ac_entry = fetch_adsb_entry(reg)
-        except Exception as e:
-            print(f"[{reg}] adsb.lol fetch failed: {e}", file=sys.stderr)
-            continue
+        ac_entry, source = fetch_adsb_entry(reg)
 
         obs = classify_observation(
             ac_entry, ts=ts,
@@ -58,10 +57,11 @@ def main(argv: list[str]) -> int:
         new_state, events = step(
             prior, obs,
             absence_threshold=config.get("absence_threshold_polls", 3),
+            inflight_interval_seconds=config.get("inflight_progress_interval_seconds", 1800),
         )
 
         print(f"[{reg}] {prior['status']} -> {new_state['status']}"
-              f"  obs={obs['kind']}"
+              f"  obs={obs['kind']}  source={source or 'none'}"
               f"  events={[e.type for e in events]}")
 
         if new_state != prior:
@@ -90,16 +90,27 @@ def main(argv: list[str]) -> int:
     return 0
 
 
-def fetch_adsb_entry(reg: str) -> dict | None:
-    r = requests.get(
-        ADSB_URL.format(reg=reg),
-        headers={"User-Agent": "flight-tracker (github.com)"},
-        timeout=HTTP_TIMEOUT,
-    )
-    r.raise_for_status()
-    data = r.json()
-    ac_list = data.get("ac") or []
-    return ac_list[0] if ac_list else None
+def fetch_adsb_entry(reg: str) -> tuple[dict | None, str | None]:
+    """Try each ADS-B source in order. Return (entry, source_name).
+
+    Both sources use the same `{"ac": [...]}` schema. We declare the plane
+    absent only if ALL sources return empty (or fail). A failure on one
+    source falls through to the next — we don't raise.
+    """
+    for src in ADSB_SOURCES:
+        try:
+            r = requests.get(
+                src["url"].format(reg=reg),
+                headers={"User-Agent": "flight-tracker (github.com/steev611/flight-tracker)"},
+                timeout=HTTP_TIMEOUT,
+            )
+            r.raise_for_status()
+            ac_list = r.json().get("ac") or []
+            if ac_list:
+                return ac_list[0], src["name"]
+        except Exception as e:
+            print(f"  source {src['name']} failed: {e}", file=sys.stderr)
+    return None, None
 
 
 def record_event(ev, ac: dict, new_state: dict, prior: dict, dry_run: bool):
@@ -175,14 +186,35 @@ def render_email(ac: dict, ev) -> tuple[str, str]:
     if ev.type == "landing":
         arr = ev.details.get("arrived_at") or {}
         dest = airports.describe_position(arr.get("lat"), arr.get("lon"))
+        elapsed = ev.details.get("elapsed_seconds")
+        duration_str = _fmt_duration(elapsed) if elapsed else "unknown"
         subj = f"[{reg}] Landed at {dest}"
         body = (
             f"Aircraft: {reg} ({type_owner})\n"
             f"Status: ON GROUND\n"
             f"Arrived at: {dest}\n"
             f"Position: {arr.get('lat')}, {arr.get('lon')}\n"
+            f"Flight duration: {duration_str}\n"
             f"Detected at: {now}\n\n"
             f"Live view (last trace): {live}\n"
+        )
+        return subj, body
+
+    if ev.type == "in_flight_progress":
+        pos = ev.details.get("position") or {}
+        cur = airports.describe_position(pos.get("lat"), pos.get("lon"), max_nm=30)
+        elapsed = ev.details.get("elapsed_seconds")
+        elapsed_str = _fmt_duration(elapsed) if elapsed else "?"
+        subj = f"[{reg}] In flight — near {cur} ({elapsed_str} elapsed)"
+        body = (
+            f"Aircraft: {reg} ({type_owner})\n"
+            f"Status: AIRBORNE — in-flight progress update\n"
+            f"Currently near: {cur}\n"
+            f"Position: {pos.get('lat')}, {pos.get('lon')}\n"
+            f"Altitude: {pos.get('alt')} ft   Speed: {pos.get('gs')} kts\n"
+            f"Time since takeoff: {elapsed_str}\n"
+            f"Detected at: {now}\n\n"
+            f"Live view: {live}\n"
         )
         return subj, body
 
@@ -203,6 +235,16 @@ def render_email(ac: dict, ev) -> tuple[str, str]:
         return subj, body
 
     return f"[{reg}] {ev.type}", json.dumps(ev.details, indent=2)
+
+
+def _fmt_duration(seconds: int | None) -> str:
+    if seconds is None:
+        return "unknown"
+    h, rem = divmod(int(seconds), 3600)
+    m = rem // 60
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
 
 
 def send_email(ac: dict, ev):

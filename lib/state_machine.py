@@ -30,6 +30,7 @@ from typing import Optional
 
 GROUND_SPEED_AIRBORNE_KTS_DEFAULT = 50
 ABSENCE_THRESHOLD_POLLS_DEFAULT = 3
+INFLIGHT_PROGRESS_INTERVAL_SECONDS_DEFAULT = 1800  # 30 min
 
 
 @dataclass
@@ -46,6 +47,8 @@ def empty_state() -> dict:
         "last_position": None,
         "current_flight_id": None,
         "signal_lost_emitted": False,
+        "last_inflight_progress_ts": None,
+        "takeoff_ts": None,
     }
 
 
@@ -79,11 +82,19 @@ def classify_observation(ac_entry: Optional[dict], ts: int,
 
 
 def step(prior: dict, obs: dict,
-         absence_threshold: int = ABSENCE_THRESHOLD_POLLS_DEFAULT) -> tuple[dict, list[Event]]:
+         absence_threshold: int = ABSENCE_THRESHOLD_POLLS_DEFAULT,
+         inflight_interval_seconds: int = INFLIGHT_PROGRESS_INTERVAL_SECONDS_DEFAULT,
+         ) -> tuple[dict, list[Event]]:
     """Pure transition: given prior state + new observation, return (new_state, events).
 
-    `prior` is never mutated.
+    `prior` is never mutated. Backfills missing keys for older state files so
+    new fields (added later) don't crash on first run.
     """
+    # Backfill any missing fields from older state-file schema versions.
+    base = empty_state()
+    base.update(prior)
+    prior = base
+
     new = dict(prior)
     events: list[Event] = []
     status = prior["status"]
@@ -104,6 +115,23 @@ def step(prior: dict, obs: dict,
                 "prior_status": status,
             }))
             new["current_flight_id"] = _new_flight_id(obs["ts"])
+            new["takeoff_ts"] = obs["ts"]
+            new["last_inflight_progress_ts"] = obs["ts"]  # reset clock so first progress is ~interval later
+        else:
+            # Airborne → airborne: maybe time for a progress update.
+            last_progress = prior.get("last_inflight_progress_ts")
+            if last_progress is None:
+                last_progress = prior.get("takeoff_ts")
+            if last_progress is None:
+                last_progress = obs["ts"]
+            if obs["ts"] - last_progress >= inflight_interval_seconds:
+                events.append(Event("in_flight_progress", {
+                    "position": new["last_position"],
+                    "takeoff_ts": prior.get("takeoff_ts"),
+                    "elapsed_seconds": obs["ts"] - (prior.get("takeoff_ts") or obs["ts"]),
+                    "flight_id": prior.get("current_flight_id"),
+                }))
+                new["last_inflight_progress_ts"] = obs["ts"]
         new["status"] = "airborne"
 
     elif obs_kind == "ground":
@@ -116,8 +144,12 @@ def step(prior: dict, obs: dict,
             events.append(Event("landing", {
                 "arrived_at": new["last_position"],
                 "flight_id": prior.get("current_flight_id"),
+                "takeoff_ts": prior.get("takeoff_ts"),
+                "elapsed_seconds": (obs["ts"] - prior["takeoff_ts"]) if prior.get("takeoff_ts") else None,
             }))
             new["current_flight_id"] = None
+            new["takeoff_ts"] = None
+            new["last_inflight_progress_ts"] = None
         new["status"] = "ground"
         new["signal_lost_emitted"] = False
 

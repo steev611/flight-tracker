@@ -126,3 +126,61 @@ def test_prior_state_not_mutated():
     s_snap = dict(s)
     _ = step(s, classify_observation({"alt_baro": 30000, "gs": 400, "lat": 40, "lon": -73}, ts=1000))
     assert s == s_snap
+
+
+# ---------- step: in_flight_progress ----------
+
+def test_no_progress_event_immediately_after_takeoff():
+    s = empty_state()
+    s, _ = step(s, classify_observation({"alt_baro": 5000, "gs": 200, "lat": 40, "lon": -73}, ts=1000))  # takeoff
+    # 10 minutes later — too soon for a progress update at default 30 min interval
+    s, events = step(s, classify_observation({"alt_baro": 30000, "gs": 400, "lat": 41, "lon": -74}, ts=1600))
+    assert events == []
+
+def test_progress_event_after_interval():
+    s = empty_state()
+    s, _ = step(s, classify_observation({"alt_baro": 5000, "gs": 200, "lat": 40, "lon": -73}, ts=1000))
+    # 31 minutes later
+    s, events = step(s, classify_observation({"alt_baro": 35000, "gs": 450, "lat": 42, "lon": -75}, ts=1000 + 31*60))
+    assert len(events) == 1
+    assert events[0].type == "in_flight_progress"
+    assert events[0].details["elapsed_seconds"] == 31*60
+
+def test_repeated_progress_events_each_interval():
+    s = empty_state()
+    s, _ = step(s, classify_observation({"alt_baro": 5000, "gs": 200, "lat": 40, "lon": -73}, ts=0))
+    s, e1 = step(s, classify_observation({"alt_baro": 35000, "gs": 450, "lat": 41, "lon": -74}, ts=1800))
+    assert any(e.type == "in_flight_progress" for e in e1)
+    # 15 min later — too soon for the next
+    s, e2 = step(s, classify_observation({"alt_baro": 36000, "gs": 460, "lat": 42, "lon": -75}, ts=2700))
+    assert e2 == []
+    # 30 min after the prior progress — yes
+    s, e3 = step(s, classify_observation({"alt_baro": 37000, "gs": 470, "lat": 43, "lon": -76}, ts=3600))
+    assert any(e.type == "in_flight_progress" for e in e3)
+
+def test_landing_clears_takeoff_ts():
+    s = empty_state()
+    s, _ = step(s, classify_observation({"alt_baro": 5000, "gs": 200, "lat": 40, "lon": -73}, ts=1000))
+    assert s["takeoff_ts"] == 1000
+    s, events = step(s, classify_observation({"alt_baro": "ground", "lat": 45, "lon": 8}, ts=5500))
+    assert events[0].type == "landing"
+    assert events[0].details["elapsed_seconds"] == 4500
+    assert s["takeoff_ts"] is None
+
+def test_step_tolerates_old_state_missing_new_fields():
+    """A state file written before in_flight fields existed should still work."""
+    old_state = {
+        "status": "airborne",
+        "absent_count": 0,
+        "prior_status": None,
+        "last_position": {"lat": 40, "lon": -73, "alt": 30000, "gs": 400, "ts": 0},
+        "current_flight_id": "flt_old",
+        "signal_lost_emitted": False,
+        # missing: takeoff_ts, last_inflight_progress_ts
+    }
+    new_state, events = step(old_state, classify_observation(
+        {"alt_baro": 35000, "gs": 450, "lat": 41, "lon": -74}, ts=10000))
+    # Should not crash and should not fire spurious progress (since takeoff_ts is unknown,
+    # we treat current ts as the baseline).
+    assert new_state["status"] == "airborne"
+    assert events == []
