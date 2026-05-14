@@ -2,7 +2,7 @@
   "aircraft": {
     "N83TY": {
       "status": "absent",
-      "absent_count": 11,
+      "absent_count": 12,
       "prior_status": "unknown",
       "last_position": null,
       "current_flight_id": null,
