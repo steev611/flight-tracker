@@ -267,6 +267,11 @@ def render_page(config: dict, state: dict, flights: list[dict],
          "track": f.get("track_pts")}
         for f in flights
     ])
+    tracked_json = json.dumps([
+        {"reg": ac["registration"], "icao24": ac["icao24"].lower(),
+         "type": ac.get("type", ""), "owner": ac.get("owner", "")}
+        for ac in config["aircraft"]
+    ])
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -311,6 +316,20 @@ def render_page(config: dict, state: dict, flights: list[dict],
     .ev-emergency_squawk{{background:#fee2e2;color:#991b1b}}
     footer{{padding:20px;text-align:center;color:#9ca3af;font-size:12px}}
     footer a{{color:#6b7280}}
+    /* Live-status panel — populated by JS on page load */
+    .live-panel{{display:none;background:#fff;border-radius:8px;padding:14px 18px;margin-bottom:8px;box-shadow:0 1px 2px rgba(0,0,0,0.06);border-left:4px solid #6b7280}}
+    .live-panel.airborne{{border-left-color:#16a34a;background:linear-gradient(90deg,rgba(22,163,74,0.06),#fff 40%)}}
+    .live-panel.ground{{border-left-color:#6b7280}}
+    .live-row{{display:flex;align-items:center;gap:14px;flex-wrap:wrap}}
+    .live-dot{{width:10px;height:10px;border-radius:50%;background:#6b7280;flex-shrink:0}}
+    .live-panel.airborne .live-dot{{background:#16a34a;animation:pulse 1.4s ease-in-out infinite}}
+    @keyframes pulse{{0%{{box-shadow:0 0 0 0 rgba(22,163,74,0.6)}}70%{{box-shadow:0 0 0 8px rgba(22,163,74,0)}}100%{{box-shadow:0 0 0 0 rgba(22,163,74,0)}}}}
+    .live-title{{font-size:11px;text-transform:uppercase;letter-spacing:0.8px;color:#6b7280}}
+    .live-main{{font-size:15px;font-weight:600}}
+    .live-meta{{font-size:13px;color:#6b7280;margin-top:2px}}
+    .live-meta b{{color:#111827;font-weight:500}}
+    .live-stale{{font-size:11px;color:#9ca3af;margin-left:auto}}
+    .plane-marker{{background:#16a34a;border-radius:50%;border:2px solid #fff;box-shadow:0 0 0 2px rgba(22,163,74,0.4);width:14px!important;height:14px!important;margin-left:-7px!important;margin-top:-7px!important}}
   </style>
 </head>
 <body>
@@ -319,6 +338,9 @@ def render_page(config: dict, state: dict, flights: list[dict],
     <div class="sub">Generated {html.escape(now_str)}</div>
   </header>
   <div class="container">
+    <h2>Live</h2>
+    <div id="live-panels"></div>
+
     <h2>Watched aircraft</h2>
     <div class="cards">{''.join(cards)}</div>
 
@@ -352,6 +374,7 @@ def render_page(config: dict, state: dict, flights: list[dict],
           crossorigin=""></script>
   <script>
     const flights = {flights_json};
+    const tracked = {tracked_json};
     const map = L.map('map');
     L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
       maxZoom: 18, attribution: '&copy; OpenStreetMap'
@@ -360,12 +383,10 @@ def render_page(config: dict, state: dict, flights: list[dict],
       const bounds = [];
       flights.forEach(f => {{
         if (f.track && f.track.length > 1) {{
-          // Tracker-captured real path
           L.polyline(f.track, {{color:'#1d4ed8', weight:3, opacity:0.85}})
             .addTo(map).bindTooltip(f.label + ' (real track)');
           f.track.forEach(pt => bounds.push(pt));
         }} else {{
-          // OpenSky backfill — only airport endpoints, render straight line dashed
           L.polyline([f.d, f.a], {{color:'#9ca3af', weight:1.5, opacity:0.6, dashArray:'4 6'}})
             .addTo(map).bindTooltip(f.label + ' (estimated)');
           bounds.push(f.d, f.a);
@@ -377,6 +398,152 @@ def render_page(config: dict, state: dict, flights: list[dict],
     }} else {{
       map.setView([54, 0], 4);
     }}
+
+    // -------- Live current-position polling --------
+    // Uses airplanes.live (CORS-open). Polls every 60s only when at least one
+    // watched aircraft is airborne; falls silent when all are on the ground.
+    const LIVE_API = "https://api.airplanes.live/v2/reg/";
+    const POLL_MS = 60000;
+    const STALE_MS = 180000;  // 3 polls
+    const panelsRoot = document.getElementById('live-panels');
+    const liveMarkers = {{}};   // keyed by icao24
+    const liveTrails = {{}};    // keyed by icao24
+    let pollTimer = null;
+
+    function fmtDuration(secs) {{
+      const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60);
+      return h ? `${{h}}h ${{m}}m` : `${{m}}m`;
+    }}
+    function fmtFL(altFt) {{
+      if (!altFt && altFt !== 0) return '—';
+      if (altFt >= 18000) return 'FL' + String(Math.floor(altFt / 100)).padStart(3, '0');
+      return altFt.toLocaleString() + ' ft';
+    }}
+
+    async function fetchOne(ac) {{
+      try {{
+        const r = await fetch(LIVE_API + encodeURIComponent(ac.reg));
+        if (!r.ok) return {{ ac, error: 'HTTP ' + r.status }};
+        const data = await r.json();
+        const entry = (data.ac || [])[0] || null;
+        return {{ ac, entry, fetchedAt: Date.now() }};
+      }} catch (e) {{
+        return {{ ac, error: String(e) }};
+      }}
+    }}
+
+    function renderPanel(r) {{
+      const id = 'live-' + r.ac.icao24;
+      let el = document.getElementById(id);
+      if (!el) {{
+        el = document.createElement('div');
+        el.id = id;
+        el.className = 'live-panel';
+        panelsRoot.appendChild(el);
+      }}
+      el.style.display = 'block';
+
+      if (r.error || !r.entry) {{
+        el.classList.remove('airborne');
+        el.classList.add('ground');
+        el.innerHTML = `
+          <div class="live-row">
+            <span class="live-dot"></span>
+            <div>
+              <div class="live-title">Currently</div>
+              <div class="live-main">${{r.ac.reg}} — on the ground</div>
+              <div class="live-meta">${{r.ac.type}}. No transponder signal right now.</div>
+            </div>
+          </div>`;
+        return false;
+      }}
+
+      const e = r.entry;
+      const onGround = e.alt_baro === 'ground';
+      const isAirborne = !onGround && typeof e.alt_baro === 'number';
+
+      if (!isAirborne) {{
+        el.classList.remove('airborne');
+        el.classList.add('ground');
+        el.innerHTML = `
+          <div class="live-row">
+            <span class="live-dot"></span>
+            <div>
+              <div class="live-title">Currently</div>
+              <div class="live-main">${{r.ac.reg}} — on the ground</div>
+              <div class="live-meta">Position: <b>${{(e.lat||0).toFixed(3)}}, ${{(e.lon||0).toFixed(3)}}</b></div>
+            </div>
+          </div>`;
+        return false;
+      }}
+
+      el.classList.add('airborne');
+      el.classList.remove('ground');
+      el.innerHTML = `
+        <div class="live-row">
+          <span class="live-dot"></span>
+          <div>
+            <div class="live-title">Live — airborne</div>
+            <div class="live-main">${{r.ac.reg}} ${{e.flight ? '· ' + e.flight.trim() : ''}}</div>
+            <div class="live-meta">
+              <b>${{fmtFL(e.alt_baro)}}</b> &middot;
+              <b>${{Math.round(e.gs || 0)}} kts</b> &middot;
+              heading <b>${{Math.round(e.track || 0)}}°</b> &middot;
+              <b>${{(e.lat||0).toFixed(3)}}, ${{(e.lon||0).toFixed(3)}}</b>
+            </div>
+          </div>
+          <div class="live-stale" id="${{id}}-stale"></div>
+        </div>`;
+      updateMarker(r.ac.icao24, e);
+      return true;
+    }}
+
+    function updateMarker(icao, e) {{
+      if (!liveMarkers[icao]) {{
+        const m = L.circleMarker([e.lat, e.lon], {{
+          radius: 9, color: '#16a34a', weight: 3, fillColor: '#16a34a', fillOpacity: 0.9
+        }}).addTo(map);
+        liveMarkers[icao] = {{ marker: m }};
+        liveTrails[icao] = {{ polyline: L.polyline([], {{color:'#16a34a', weight:2.5, opacity:0.85, dashArray:'2 4'}}).addTo(map), points: [] }};
+      }}
+      const lm = liveMarkers[icao];
+      lm.marker.setLatLng([e.lat, e.lon]);
+      lm.marker.bindTooltip(`<b>${{(e.flight||'').trim()}}</b><br>${{fmtFL(e.alt_baro)}} · ${{Math.round(e.gs||0)}} kts`);
+      const trail = liveTrails[icao];
+      const last = trail.points[trail.points.length - 1];
+      if (!last || last[0] !== e.lat || last[1] !== e.lon) {{
+        trail.points.push([e.lat, e.lon]);
+        trail.polyline.setLatLngs(trail.points);
+      }}
+      lm.lastUpdate = Date.now();
+    }}
+
+    function clearMarker(icao) {{
+      if (liveMarkers[icao]) {{ map.removeLayer(liveMarkers[icao].marker); delete liveMarkers[icao]; }}
+      if (liveTrails[icao])  {{ map.removeLayer(liveTrails[icao].polyline); delete liveTrails[icao]; }}
+    }}
+
+    async function pollOnce() {{
+      const results = await Promise.all(tracked.map(fetchOne));
+      let anyAirborne = false;
+      for (const r of results) {{
+        const flying = renderPanel(r);
+        if (flying) anyAirborne = true;
+        else clearMarker(r.ac.icao24);
+      }}
+      if (anyAirborne) {{
+        if (!pollTimer) pollTimer = setInterval(pollOnce, POLL_MS);
+      }} else {{
+        if (pollTimer) {{ clearInterval(pollTimer); pollTimer = null; }}
+      }}
+    }}
+
+    pollOnce();
+    // Pause/resume polling when the tab visibility changes (be polite to the API)
+    document.addEventListener('visibilitychange', () => {{
+      if (document.hidden && pollTimer) {{ clearInterval(pollTimer); pollTimer = null; }}
+      else if (!document.hidden) pollOnce();
+    }});
   </script>
 </body>
 </html>"""
