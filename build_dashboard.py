@@ -51,20 +51,36 @@ def main():
 
 
 def compute_stats(flights: list[dict]) -> dict:
-    now_ts = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+    now_dt = datetime.datetime.now(datetime.timezone.utc)
+    now_ts = int(now_dt.timestamp())
     week_cutoff = now_ts - 7 * 86400
     month_cutoff = now_ts - 30 * 86400
+    year_start_ts = int(datetime.datetime(now_dt.year, 1, 1, tzinfo=datetime.timezone.utc).timestamp())
 
     durations = [f.get("duration_minutes") or 0 for f in flights]
     total_minutes = sum(durations)
     longest_minutes = max(durations) if durations else 0
 
+    ytd_flights = [f for f in flights if (f.get("first_seen") or 0) >= year_start_ts]
+    ytd_distance_nm = 0
+    for f in ytd_flights:
+        if f.get("track_full"):
+            ytd_distance_nm += geo.track_distance_nm(f["track_full"])
+        else:
+            # Backfill flight: approximate as great-circle origin -> dest
+            ytd_distance_nm += geo.haversine_nm(
+                f["departure_lat"], f["departure_lon"],
+                f["arrival_lat"], f["arrival_lon"])
+
     return {
-        "total":       len(flights),
-        "this_week":   sum(1 for f in flights if (f.get("first_seen") or 0) >= week_cutoff),
-        "this_month":  sum(1 for f in flights if (f.get("first_seen") or 0) >= month_cutoff),
-        "total_time":  _fmt_hm(total_minutes),
-        "longest":     _fmt_hm(longest_minutes),
+        "total":         len(flights),
+        "this_week":     sum(1 for f in flights if (f.get("first_seen") or 0) >= week_cutoff),
+        "this_month":    sum(1 for f in flights if (f.get("first_seen") or 0) >= month_cutoff),
+        "total_time":    _fmt_hm(total_minutes),
+        "longest":       _fmt_hm(longest_minutes),
+        "ytd_flights":   len(ytd_flights),
+        "ytd_distance":  f"{round(ytd_distance_nm):,} nm",
+        "ytd_year":      now_dt.year,
     }
 
 
@@ -330,6 +346,9 @@ def render_page(config: dict, state: dict, flights: list[dict],
     .live-meta b{{color:#111827;font-weight:500}}
     .live-stale{{font-size:11px;color:#9ca3af;margin-left:auto}}
     .plane-marker{{background:#16a34a;border-radius:50%;border:2px solid #fff;box-shadow:0 0 0 2px rgba(22,163,74,0.4);width:14px!important;height:14px!important;margin-left:-7px!important;margin-top:-7px!important}}
+    .plane-icon{{background:transparent;border:none}}
+    .plane-svg{{width:32px;height:32px;display:flex;align-items:center;justify-content:center;transition:transform 0.4s ease}}
+    .plane-svg svg{{width:100%;height:100%;filter:drop-shadow(0 1px 3px rgba(0,0,0,0.45))}}
   </style>
 </head>
 <body>
@@ -349,6 +368,8 @@ def render_page(config: dict, state: dict, flights: list[dict],
       <div class="stat"><div class="stat-num">{stats['total']}</div><div class="stat-label">Total flights tracked</div></div>
       <div class="stat"><div class="stat-num">{stats['this_week']}</div><div class="stat-label">This week</div></div>
       <div class="stat"><div class="stat-num">{stats['this_month']}</div><div class="stat-label">Last 30 days</div></div>
+      <div class="stat"><div class="stat-num">{stats['ytd_flights']}</div><div class="stat-label">{stats['ytd_year']} to date</div></div>
+      <div class="stat"><div class="stat-num">{html.escape(stats['ytd_distance'])}</div><div class="stat-label">{stats['ytd_year']} distance</div></div>
       <div class="stat"><div class="stat-num">{html.escape(stats['total_time'])}</div><div class="stat-label">Total time aloft</div></div>
       <div class="stat"><div class="stat-num">{html.escape(stats['longest'])}</div><div class="stat-label">Longest flight</div></div>
     </div>
@@ -498,17 +519,26 @@ def render_page(config: dict, state: dict, flights: list[dict],
       return true;
     }}
 
+    function makePlaneIcon(headingDeg) {{
+      const html = `<div class="plane-svg" style="transform: rotate(${{headingDeg}}deg)">
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+          <path d="M12 2 L13.4 11 L22 14.2 V16 L13.4 14 L12.6 21 L15 22.4 V24 L9 24 V22.4 L11.4 21 L10.6 14 L2 16 V14.2 L10.6 11 L12 2 Z"
+                fill="#16a34a" stroke="#ffffff" stroke-width="1.1" stroke-linejoin="round"/>
+        </svg></div>`;
+      return L.divIcon({{ className:'plane-icon', html, iconSize:[32,32], iconAnchor:[16,16] }});
+    }}
+
     function updateMarker(icao, e) {{
+      const heading = (typeof e.track === 'number') ? e.track : 0;
       if (!liveMarkers[icao]) {{
-        const m = L.circleMarker([e.lat, e.lon], {{
-          radius: 9, color: '#16a34a', weight: 3, fillColor: '#16a34a', fillOpacity: 0.9
-        }}).addTo(map);
+        const m = L.marker([e.lat, e.lon], {{ icon: makePlaneIcon(heading) }}).addTo(map);
         liveMarkers[icao] = {{ marker: m }};
         liveTrails[icao] = {{ polyline: L.polyline([], {{color:'#16a34a', weight:2.5, opacity:0.85, dashArray:'2 4'}}).addTo(map), points: [] }};
       }}
       const lm = liveMarkers[icao];
       lm.marker.setLatLng([e.lat, e.lon]);
-      lm.marker.bindTooltip(`<b>${{(e.flight||'').trim()}}</b><br>${{fmtFL(e.alt_baro)}} · ${{Math.round(e.gs||0)}} kts`);
+      lm.marker.setIcon(makePlaneIcon(heading));
+      lm.marker.bindTooltip(`<b>${{(e.flight||'').trim()}}</b><br>${{fmtFL(e.alt_baro)}} · ${{Math.round(e.gs||0)}} kts · hdg ${{Math.round(heading)}}°`);
       const trail = liveTrails[icao];
       const last = trail.points[trail.points.length - 1];
       if (!last || last[0] !== e.lat || last[1] !== e.lon) {{

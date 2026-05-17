@@ -12,7 +12,7 @@ from email.message import EmailMessage
 
 import requests
 
-from lib import airports, email_html, ntfy, geo
+from lib import airports, email_html, ntfy, geo, metar
 from lib.state_machine import classify_observation, empty_state, step
 from lib.timefmt import fmt_dual
 
@@ -224,6 +224,8 @@ def render_email(ac: dict, ev, tz_name: str = "Europe/London") -> tuple[str, str
 
     if ev.type == "landing":
         arr = ev.details.get("arrived_at") or {}
+        arr_a = airports.nearest(arr.get("lat"), arr.get("lon")) \
+            if arr.get("lat") is not None else None
         dest = airports.describe_position(arr.get("lat"), arr.get("lon"))
         elapsed = ev.details.get("elapsed_seconds")
         duration_str = _fmt_duration(elapsed) if elapsed else "unknown"
@@ -232,6 +234,9 @@ def render_email(ac: dict, ev, tz_name: str = "Europe/London") -> tuple[str, str
         peak_alt = geo.peak_altitude_ft(track)
         distance_str = f"{distance_nm:,} nm" if distance_nm else "—"
         peak_str = geo.fmt_fl(peak_alt)
+        wx = metar.fetch(arr_a["icao"]) if arr_a else None
+        wx_summary = wx["summary"] if wx else None
+        wx_raw = wx["raw"] if wx else None
         subj = f"[{reg}] Landed at {dest}"
         body = (
             f"Aircraft: {reg} ({type_owner})\n"
@@ -241,16 +246,25 @@ def render_email(ac: dict, ev, tz_name: str = "Europe/London") -> tuple[str, str
             f"Flight duration: {duration_str}\n"
             f"Distance flown: {distance_str}\n"
             f"Peak altitude: {peak_str}\n"
+        )
+        if wx_summary:
+            body += f"Weather at {arr_a['icao']}: {wx_summary}\n"
+        if wx_raw:
+            body += f"  Raw METAR: {wx_raw}\n"
+        body += (
             f"Detected at: {now}\n\n"
             f"Live view (last trace): {live}\n"
             f"Dashboard: {DASHBOARD_URL}\n"
         )
-        html_body = _html(f"Arrived at {dest}", [
+        rows = [
             ("Position",         f"{arr.get('lat')}, {arr.get('lon')}"),
             ("Flight duration",  duration_str),
             ("Distance flown",   distance_str),
             ("Peak altitude",    peak_str),
-        ])
+        ]
+        if wx_summary:
+            rows.append((f"Weather at {arr_a['icao']}", wx_summary))
+        html_body = _html(f"Arrived at {dest}", rows)
         return subj, body, html_body
 
     if ev.type == "in_flight_progress":
