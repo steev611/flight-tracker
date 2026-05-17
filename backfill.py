@@ -35,7 +35,13 @@ def main():
     days = int(os.environ.get("BACKFILL_DAYS", DEFAULT_DAYS))
     client_id = os.environ["OPENSKY_CLIENT_ID"]
     client_secret = os.environ["OPENSKY_CLIENT_SECRET"]
-    token = get_token(client_id, client_secret)
+
+    # Closure: refresh token on demand (401 mid-run, e.g. on long backfills).
+    state = {"token": get_token(client_id, client_secret)}
+    def token_provider(refresh: bool = False) -> str:
+        if refresh:
+            state["token"] = get_token(client_id, client_secret)
+        return state["token"]
 
     config = json.loads(CONFIG_PATH.read_text())
     FLIGHTS_DIR.mkdir(exist_ok=True)
@@ -50,7 +56,10 @@ def main():
         icao24 = ac["icao24"].lower()
         out_path = FLIGHTS_DIR / f"backfill_{reg}.jsonl"
         print(f"\n=== Backfilling {reg} ({icao24}) for last {days} days ===")
-        flights = pull_flights(token, icao24, midnight_utc, days)
+        flights = pull_flights(token_provider, icao24, midnight_utc, days)
+        if not flights:
+            print(f"  no flights returned — keeping existing {out_path.name}", file=sys.stderr)
+            continue
         flights = dedupe_flights(flights)
         flights.sort(key=lambda f: f["firstSeen"])
         with out_path.open("w", encoding="utf-8") as f:
@@ -88,32 +97,61 @@ def get_token(client_id: str, client_secret: str) -> str:
     raise RuntimeError(f"OpenSky token fetch failed after {RETRY_ATTEMPTS} attempts: {last_exc}")
 
 
-def pull_flights(token: str, icao24: str, midnight_utc: int, days: int) -> list[dict]:
-    """Loop one UTC day at a time backward from today's midnight."""
+def pull_flights(token_provider, icao24: str, midnight_utc: int, days: int) -> list[dict]:
+    """Loop one UTC day at a time backward from today's midnight.
+
+    `token_provider` is a callable: `token_provider(refresh=False)` returns the
+    current access token, `token_provider(refresh=True)` forces a re-auth.
+    Refresh is triggered automatically on a 401 response.
+    """
     out = []
     for i in range(1, days + 1):
         end = midnight_utc - (i - 1) * DAY
         begin = end - DAY
+        day_label = datetime.date.fromtimestamp(begin)
+        chunk = _fetch_day_with_retry(token_provider, icao24, begin, end, day_label)
+        if chunk:
+            out.extend(chunk)
+        # Throttle to stay well under OpenSky's per-minute rate limit.
+        time.sleep(1.5)
+        # Print progress every 10 days so a long-running job isn't silent.
+        if i % 10 == 0:
+            print(f"  ... {i}/{days} days scanned ({len(out)} flights so far)", flush=True)
+    return out
+
+
+def _fetch_day_with_retry(token_provider, icao24: str, begin: int, end: int, day_label) -> list[dict]:
+    """Single-day fetch; retries on 401 (token refresh) and 429 (rate limit)."""
+    retried_401 = False
+    for attempt in (1, 2, 3):
         r = requests.get(
             API_URL,
             params={"icao24": icao24, "begin": begin, "end": end},
-            headers={"Authorization": f"Bearer {token}"},
+            headers={"Authorization": f"Bearer {token_provider()}"},
             timeout=30,
         )
         if r.status_code == 404:
-            continue  # no flights that day
+            return []
+        if r.status_code == 401 and not retried_401:
+            retried_401 = True
+            print(f"  {day_label}: 401, refreshing token", file=sys.stderr, flush=True)
+            token_provider(refresh=True)
+            continue
+        if r.status_code == 429:
+            if attempt < 3:
+                wait = int(r.headers.get("Retry-After", "30"))
+                print(f"  {day_label}: 429, backing off {wait}s", file=sys.stderr, flush=True)
+                time.sleep(wait)
+                continue
+            return []
         if r.status_code != 200:
-            print(f"  {datetime.date.fromtimestamp(begin)}: HTTP {r.status_code} {r.text[:80]}", file=sys.stderr)
-            continue
+            print(f"  {day_label}: HTTP {r.status_code} {r.text[:80]}", file=sys.stderr, flush=True)
+            return []
         try:
-            chunk = r.json()
+            return r.json() or []
         except Exception:
-            continue
-        if chunk:
-            out.extend(chunk)
-        # Light politeness pause; OpenSky tolerates fast queries but no need to hammer.
-        time.sleep(0.1)
-    return out
+            return []
+    return []
 
 
 def dedupe_flights(flights: list[dict], tolerance_seconds: int = 300) -> list[dict]:
